@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <QTRSensors.h>
 #include "BluetoothSerial.h"
+#include "Motors.h"
 
 // Constantes para el bluetooth
 const char* name = "LineFollowerJR";
@@ -12,8 +14,15 @@ const int LED_BUILTIN = 2;
 const int LED_BT_CLIENT_CONNECTED_DELAY = 9;
 const int LED_BT_INITIALIZED_DELAY = 1;
 
+// Constantes para el control de la medición de los sensores
+const int MEASURE_DELAY = 250;
+
 // Constantes para las entradas y salidas
-const uint8_t LED_PIN = 2;
+const uint8_t INPUT_1 = 15;
+const uint8_t INPUT_2 = 16;
+const uint8_t INPUT_3 = 17;
+const uint8_t INPUT_4 = 18;
+const uint8_t INPUT_5 = 19;
 
 // Constantes para las direcciones de los archivos de configuración
 const char* KP_PATH = "/kp.txt";
@@ -23,10 +32,16 @@ const char* SPEED_PATH = "/speed.txt";
 
 // Variables para el control de los motores
 int left_motor_speed, right_motor_speed;
-
-// variables to hold the parsed data
-float kp = 0.0, ki = 0.0, kd = 0.0;
 int speed = 0;
+
+// Variables para recibir los datos convertidos
+float kp = 0.0, ki = 0.0, kd = 0.0;
+
+// Constante para el SETPOINT del PID
+const int SETPOINT = 2000;
+
+// Variables para el algoritmo del PID
+int error, last_input, integral, derivative;
 
 // // Variables para los parámetros del PID
 String strKp;
@@ -36,8 +51,11 @@ String strSpeed;
 
 // Variables para el control del led indicador
 unsigned long previous_led_millis = 0;
-int leg_brightness = 0;
+int led_brightness = 0;
 int brightness_step = 1;
+
+//variables para el control de la medida de los sensores
+unsigned long previous_measure_millis = 0;
 
 // Variable for bt status
 int bt_status = 0;
@@ -48,7 +66,14 @@ char tempChars[numChars];  // temporary array for use when parsing
 
 bool newData = false;
 
+const uint8_t sensorCount = 5;
+uint16_t sensorValues[sensorCount];
+
+QTRSensors qtr;
+
 BluetoothSerial SerialBT;
+
+Motors motors;
 
 void initLittleFS() {
   if (!LittleFS.begin(true)) {
@@ -176,6 +201,7 @@ void BT_EventHandler(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
     recvWithStartEndMarkers();
 
     if (newData == true) {
+      // Se tiene que enviar una cadena con el siguiente formato "<kp, ki, kd, vel>"
       strcpy(tempChars, receivedChars);
       // this temporary copy is necessary to protect the original data
       //   because strtok() used in parseData() replaces the commas with \0
@@ -200,14 +226,25 @@ void BT_EventHandler(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
 }
 
 void setup() {
+  pinMode(INPUT_1, INPUT);
+  pinMode(INPUT_2, INPUT);
+  pinMode(INPUT_3, INPUT);
+  pinMode(INPUT_4, INPUT);
+  pinMode(INPUT_5, INPUT);
+
   Serial.begin(115200);
+
+  qtr.setTypeRC();
+  qtr.setSensorPins((const uint8_t[]){ INPUT_1, INPUT_2, INPUT_3, INPUT_4, INPUT_5 }, sensorCount);
+
+  delay(50);
 
   initBluetooth();
 
   initLittleFS();
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
 
   strKp = readFile(KP_PATH);
   strKi = readFile(KI_PATH);
@@ -227,28 +264,93 @@ void setup() {
   Serial.print(kd, 3);
   Serial.print(", vel: ");
   Serial.println(speed);
+
+  digitalWrite(LED_BUILTIN, HIGH);  // turn on Arduino's LED to indicate we are in calibration mode
+
+  // 2.5 ms RC read timeout (default) * 10 reads per calibrate() call
+  // = ~25 ms per calibrate() call.
+  // Call calibrate() 400 times to make calibration take about 10 seconds.
+  for (uint16_t i = 0; i < 400; i++) {
+    qtr.calibrate();
+  }
+  digitalWrite(LED_BUILTIN, LOW);  // turn off Arduino's LED to indicate we are through with calibration
+
+  // print the calibration minimum values measured when emitters were on
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    Serial.print(qtr.calibrationOn.minimum[i]);
+    Serial.print(' ');
+  }
+  Serial.println();
+
+  // print the calibration maximum values measured when emitters were on
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    Serial.print(qtr.calibrationOn.maximum[i]);
+    Serial.print(' ');
+  }
+  Serial.println();
+  delay(1000);
+
+  // motors.motors(100, 100);
 }
 
 void loop() {
+  if (millis() - previous_measure_millis >= MEASURE_DELAY) {
+    previous_measure_millis = millis();
+    uint16_t entrada = qtr.readLineBlack(sensorValues);
+
+    error = entrada - SETPOINT;
+
+    derivative = entrada - last_input;
+
+    integral += error;
+    integral = constrain(integral, -1000, 1000);
+
+    int diff = (kp * error) + (ki * integral) + (kd * derivative);
+
+    last_input = entrada;
+
+    diff = constrain(diff, -255, 255);
+
+    Serial.print(kp);
+    Serial.print(", ");
+    Serial.print(ki);
+    Serial.print(", ");
+    Serial.print(kd);
+    Serial.print(", ");
+    Serial.print(speed);
+    Serial.print(", ");
+    Serial.print(error);
+    Serial.print(", ");
+    Serial.println(diff);
+    // print the sensor values as numbers from 0 to 1000, where 0 means maximum
+    // reflectance and 1000 means minimum reflectance, followed by the line
+    // entrada
+    // for (uint8_t i = 0; i < sensorCount; i++) {
+    //   Serial.print(sensorValues[i]);
+    //   Serial.print('\t');
+    // }
+    // Serial.println(entrada);
+  }
+
   if (millis() - previous_led_millis >= LED_BT_CLIENT_CONNECTED_DELAY && bt_status == ESP_SPP_SRV_OPEN_EVT) {
     previous_led_millis = millis();
 
-    leg_brightness += brightness_step;
-    if (leg_brightness == 0 || leg_brightness == 255) {
+    led_brightness += brightness_step;
+    if (led_brightness == 0 || led_brightness == 255) {
       brightness_step = -brightness_step;
     }
 
-    analogWrite(LED_BUILTIN, leg_brightness);
+    analogWrite(LED_BUILTIN, led_brightness);
   }
 
   if (millis() - previous_led_millis >= LED_BT_INITIALIZED_DELAY && (bt_status == ESP_SPP_START_EVT || bt_status == ESP_SPP_CLOSE_EVT)) {
     previous_led_millis = millis();
 
-    leg_brightness += brightness_step;
-    if (leg_brightness == 0 || leg_brightness == 255) {
+    led_brightness += brightness_step;
+    if (led_brightness == 0 || led_brightness == 255) {
       brightness_step = -brightness_step;
     }
 
-    analogWrite(LED_BUILTIN, leg_brightness);
+    analogWrite(LED_BUILTIN, led_brightness);
   }
 }
