@@ -15,7 +15,7 @@ const int LED_BT_CLIENT_CONNECTED_DELAY = 9;
 const int LED_BT_INITIALIZED_DELAY = 1;
 
 // Constantes para el control de la medición de los sensores
-const int MEASURE_DELAY = 250;
+const int MEASURE_DELAY = 1;
 
 // Constantes para las entradas y salidas
 const uint8_t INPUT_1 = 15;
@@ -23,6 +23,7 @@ const uint8_t INPUT_2 = 16;
 const uint8_t INPUT_3 = 17;
 const uint8_t INPUT_4 = 18;
 const uint8_t INPUT_5 = 19;
+const uint8_t BUTTON = 21;
 
 // Constantes para las direcciones de los archivos de configuración
 const char* KP_PATH = "/kp.txt";
@@ -32,7 +33,7 @@ const char* SPEED_PATH = "/speed.txt";
 
 // Variables para el control de los motores
 int left_motor_speed, right_motor_speed;
-int speed = 0;
+int max_speed = 0, min_speed = 0;
 
 // Variables para recibir los datos convertidos
 float kp = 0.0, ki = 0.0, kd = 0.0;
@@ -54,8 +55,11 @@ unsigned long previous_led_millis = 0;
 int led_brightness = 0;
 int brightness_step = 1;
 
-//variables para el control de la medida de los sensores
+// Variables para el control de la medida de los sensores
 unsigned long previous_measure_millis = 0;
+
+// Variable para el estado del boton dentro del loop
+bool button_pressed;
 
 // Variable for bt status
 int bt_status = 0;
@@ -122,8 +126,8 @@ void writeFile(const char* path, const char* data) {
 
 void initBluetooth() {
   Serial.println("Iniciando Bluetooth");
-  SerialBT.begin(name);                         // Initialize bt with the name of the device
-  SerialBT.register_callback(BT_EventHandler);  // Register callback function for BT events
+  SerialBT.begin(name);                        // Initialize bt with the name of the device
+  SerialBT.register_callback(btEventHandler);  // Register callback function for BT events
 }
 
 void recvWithStartEndMarkers() {
@@ -171,7 +175,9 @@ void parseData() {  // split the data into its parts
   kd = atof(strtokIndx);           // convert this part to an integer
 
   strtokIndx = strtok(NULL, ",");
-  speed = atoi(strtokIndx);  // convert this part to a float
+  max_speed = atoi(strtokIndx);  // convert this part to a int
+
+  min_speed = (-1) * max_speed;
 }
 
 void showParsedData() {
@@ -181,12 +187,14 @@ void showParsedData() {
   Serial.print(ki, 3);
   Serial.print(", kd: ");
   Serial.print(kd, 3);
-  Serial.print(", vel: ");
-  Serial.println(speed);
+  Serial.print(", max vel: ");
+  Serial.print(max_speed);
+  Serial.print(", min vel: ");
+  Serial.println(min_speed);
 }
 
 // Bluetooth Event Handler CallBack Function Definition
-void BT_EventHandler(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
+void btEventHandler(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
   if (event == ESP_SPP_START_EVT) {
     bt_status = event;
     Serial.println("Bluetooth inicializado");
@@ -219,7 +227,7 @@ void BT_EventHandler(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
       dtostrf(kd, 8, 3, str);
       writeFile(KD_PATH, str);
 
-      sprintf(str, "%d", speed);
+      sprintf(str, "%d", max_speed);
       writeFile(SPEED_PATH, str);
     }
   }
@@ -231,6 +239,7 @@ void setup() {
   pinMode(INPUT_3, INPUT);
   pinMode(INPUT_4, INPUT);
   pinMode(INPUT_5, INPUT);
+  pinMode(BUTTON, INPUT_PULLUP);
 
   Serial.begin(115200);
 
@@ -244,7 +253,6 @@ void setup() {
   initLittleFS();
 
   pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
 
   strKp = readFile(KP_PATH);
   strKi = readFile(KI_PATH);
@@ -254,7 +262,8 @@ void setup() {
   kp = strKp.toFloat();
   ki = strKi.toFloat();
   kd = strKd.toFloat();
-  speed = strSpeed.toInt();
+  max_speed = strSpeed.toInt();
+  min_speed = (-1) * max_speed;
 
   Serial.print("kp: ");
   Serial.print(kp, 3);
@@ -262,8 +271,17 @@ void setup() {
   Serial.print(ki, 3);
   Serial.print(", kd: ");
   Serial.print(kd, 3);
-  Serial.print(", vel: ");
-  Serial.println(speed);
+  Serial.print(", max vel: ");
+  Serial.print(max_speed);
+  Serial.print(", min vel: ");
+  Serial.println(min_speed);
+
+  while (digitalRead(BUTTON)) {
+    digitalWrite(LED_BUILTIN, HIGH);  // turn on Arduino's LED to indicate we are in calibration mode
+    delay(300);
+    digitalWrite(LED_BUILTIN, LOW);  // turn on Arduino's LED to indicate we are in calibration mode
+    delay(300);
+  }
 
   digitalWrite(LED_BUILTIN, HIGH);  // turn on Arduino's LED to indicate we are in calibration mode
 
@@ -273,7 +291,12 @@ void setup() {
   for (uint16_t i = 0; i < 400; i++) {
     qtr.calibrate();
   }
+
   digitalWrite(LED_BUILTIN, LOW);  // turn off Arduino's LED to indicate we are through with calibration
+
+  while (digitalRead(BUTTON)) {
+    ledStatus();
+  };
 
   // print the calibration minimum values measured when emitters were on
   for (uint8_t i = 0; i < sensorCount; i++) {
@@ -288,50 +311,11 @@ void setup() {
     Serial.print(' ');
   }
   Serial.println();
-  delay(1000);
 
-  // motors.motors(100, 100);
+  delay(1000);
 }
 
-void loop() {
-  if (millis() - previous_measure_millis >= MEASURE_DELAY) {
-    previous_measure_millis = millis();
-    uint16_t entrada = qtr.readLineBlack(sensorValues);
-
-    error = entrada - SETPOINT;
-
-    derivative = entrada - last_input;
-
-    integral += error;
-    integral = constrain(integral, -1000, 1000);
-
-    int diff = (kp * error) + (ki * integral) + (kd * derivative);
-
-    last_input = entrada;
-
-    diff = constrain(diff, -255, 255);
-
-    Serial.print(kp);
-    Serial.print(", ");
-    Serial.print(ki);
-    Serial.print(", ");
-    Serial.print(kd);
-    Serial.print(", ");
-    Serial.print(speed);
-    Serial.print(", ");
-    Serial.print(error);
-    Serial.print(", ");
-    Serial.println(diff);
-    // print the sensor values as numbers from 0 to 1000, where 0 means maximum
-    // reflectance and 1000 means minimum reflectance, followed by the line
-    // entrada
-    // for (uint8_t i = 0; i < sensorCount; i++) {
-    //   Serial.print(sensorValues[i]);
-    //   Serial.print('\t');
-    // }
-    // Serial.println(entrada);
-  }
-
+void ledStatus() {
   if (millis() - previous_led_millis >= LED_BT_CLIENT_CONNECTED_DELAY && bt_status == ESP_SPP_SRV_OPEN_EVT) {
     previous_led_millis = millis();
 
@@ -353,4 +337,65 @@ void loop() {
 
     analogWrite(LED_BUILTIN, led_brightness);
   }
+}
+
+void loop() {
+  // if (millis() - previous_measure_millis >= MEASURE_DELAY) {
+  previous_measure_millis = millis();
+
+  uint16_t entrada = qtr.readLineBlack(sensorValues);
+
+  error = entrada - SETPOINT;
+
+  if (error >= 500) {
+    motors.motors(-255, 255);
+  } else if (error <= -500) {
+    motors.motors(255, -255);
+  }
+
+  derivative = entrada - last_input;
+
+  integral += error;
+  integral = constrain(integral, -1000, 1000);
+
+  int diff = (kp * error) + (ki * integral) + (kd * derivative);
+
+  last_input = entrada;
+
+  diff = constrain(diff, -500, 500);
+
+  left_motor_speed = constrain(max_speed - diff, min_speed, max_speed);
+  right_motor_speed = constrain(max_speed + diff, min_speed, max_speed);
+
+  (diff > 0) ? motors.motors(left_motor_speed, max_speed) : motors.motors(max_speed, right_motor_speed);
+
+  // Serial.print(kp);
+  // Serial.print(", ");
+  // Serial.print(ki);
+  // Serial.print(", ");
+  // Serial.print(kd);
+  // Serial.print(", ");
+  // Serial.print(error);
+  // Serial.print(", ");
+  // Serial.print(diff);
+  // Serial.print(", ");
+  // Serial.print(max_speed);
+  // Serial.print(", ");
+  // Serial.print(min_speed);
+  // Serial.print(", ");
+  // Serial.print(left_motor_speed);
+  // Serial.print(", ");
+  // Serial.println(right_motor_speed);
+
+  // print the sensor values as numbers from 0 to 1000, where 0 means maximum
+  // reflectance and 1000 means minimum reflectance, followed by the line
+  // entrada
+  // for (uint8_t i = 0; i < sensorCount; i++) {
+  //   Serial.print(sensorValues[i]);
+  //   Serial.print('\t');
+  // }
+  // Serial.println(entrada);
+  // }
+
+  // ledStatus();
 }
